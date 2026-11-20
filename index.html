@@ -582,14 +582,9 @@ async function postPhotoComment(task, code, atts){
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ data: { html_text: '<body>' + html + '</body>' } })
   });
-  try {
-    // 先試留言內直接顯示照片
-    await post(head + '\n' + atts.map(a => '<img data-asana-gid="' + a.gid + '"/>').join(''));
-  } catch(e){
-    if (/scope/i.test(e.message)) throw e;
-    // Asana 不接受留言內嵌圖片時，改成照片連結
-    await post(head + '\n' + atts.map((a, i) => '<a href="' + esc(a.permanent_url || a.view_url || '') + '">照片 ' + (i + 1) + '</a>').join('\n'));
-  }
+  // 照片本身上傳後，Asana 會自動在任務底下顯示「已附加」並附縮圖；
+  // 留言只寫文字說明，避免同一張照片出現兩次。
+  await post(head);
 }
 $('btnUpload').onclick = async () => {
   const task = selectedTask; if (!task || !photos.length) return;
