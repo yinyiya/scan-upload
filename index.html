@@ -48,7 +48,8 @@ label{font-size:14px;color:var(--mute);display:block;margin:8px 0 4px}
   <div class="step">Asana 帳號</div>
   <div id="loggedOut">
     <button id="btnLogin">用 Asana 帳號登入</button>
-    <div class="msg" style="font-size:13px;color:var(--mute)">會跳到 Asana 官方頁面，選好帳號按「允許」就完成；之後會一直保持登入。</div>
+    <div class="msg" style="font-size:13px;color:var(--mute)">會在瀏覽器裡打開 Asana 官方登入頁（公司 SSO 也可以），按「允許」就完成；之後會一直保持登入。</div>
+    <div class="msg" style="font-size:13px;color:var(--mute)">如果跳到 Asana App 顯示「無法載入內容」：回到這頁，<b>長按</b>下面這個連結 →「在新分頁中打開」。<br><a id="loginLink" href="#">👉 在瀏覽器登入 Asana</a></div>
   </div>
   <div id="loggedIn" class="hidden">
     <div class="row" style="align-items:center">
@@ -144,8 +145,9 @@ function showLogin(){
 }
 $('btnAccount').onclick = () => { showLogin.open = !showLogin.open; showLogin(); };
 
-$('btnLogin').onclick = async () => {
-  if (ASANA_CLIENT_ID.startsWith('__')) { setMsg('loginMsg', '登入功能還沒設定完成（缺 Client ID）', 'err'); return; }
+// 預先產生登入網址（PKCE），按鈕與備用連結共用同一組
+let loginUrl = null;
+async function prepareLogin(){
   const verifier = randStr(48);
   const state = randStr(16);
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
@@ -155,7 +157,16 @@ $('btnLogin').onclick = async () => {
     client_id: ASANA_CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: 'code',
     state, code_challenge_method: 'S256', code_challenge: b64url(digest), scope: SCOPES
   });
-  location.href = 'https://app.asana.com/-/oauth_authorize?' + q.toString().replace(/\+/g, '%20');
+  loginUrl = 'https://app.asana.com/-/oauth_authorize?' + q.toString().replace(/\+/g, '%20');
+  $('loginLink').href = loginUrl;
+  return loginUrl;
+}
+// iPhone 有裝 Asana App 時，直接點 app.asana.com 的連結會被 App 攔走（App 打不開登入頁）。
+// 所以先跳到自己的頁面（?go=1），再由頁面自動轉到 Asana —— 非手指點擊的轉址不會被 App 攔截。
+$('btnLogin').onclick = async () => {
+  const url = loginUrl || await prepareLogin();
+  store.set('auth_go', url);
+  location.href = REDIRECT_URI + '?go=1';
 };
 
 async function authCall(path, body){
@@ -215,7 +226,16 @@ async function asana(path, opts = {}, retried){
   if (!res.ok) throw new Error((body.errors && body.errors[0] && body.errors[0].message) || ('HTTP ' + res.status));
   return body;
 }
-handleRedirect().finally(showLogin);
+(function boot(){
+  const u = new URL(location.href);
+  if (u.searchParams.get('go') === '1'){
+    const go = store.get('auth_go', '');
+    store.del('auth_go');
+    if (go.startsWith('https://app.asana.com/-/oauth_authorize?')){ location.replace(go); return; }
+    history.replaceState(null, '', REDIRECT_URI);
+  }
+  handleRedirect().finally(() => { showLogin(); if (!getAuth()) prepareLogin(); });
+})();
 
 // ---------- scanning ----------
 // 引擎：手機有原生 BarcodeDetector（多數 Android Chrome）就用原生（最快）；否則用 ZXing。
