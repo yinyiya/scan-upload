@@ -106,7 +106,7 @@ const API = 'https://app.asana.com/api/1.0';
 const ASANA_CLIENT_ID = '1220734431533437';
 const AUTH_SERVER = 'https://scan-upload-auth.qwe871126.workers.dev';
 const REDIRECT_URI = 'https://yinyiya.github.io/scan-upload/';
-const SCOPES = 'tasks:read attachments:write users:read';
+const SCOPES = 'tasks:read attachments:write users:read stories:read stories:write';
 const WORKSPACE = '1207521339934269';
 const PROJECT = '1209208905247931';            // 門市-倉儲
 // =================================================================
@@ -123,7 +123,13 @@ let photos = []; // {blob, url}
 function setMsg(id, text, cls){ const el = $(id); el.textContent = text; el.className = 'msg' + (cls ? ' ' + cls : ''); }
 
 // ---------- Asana 登入（OAuth + PKCE，密鑰放在 Cloudflare Worker） ----------
-function getAuth(){ try { return JSON.parse(store.get('asana_auth', 'null')); } catch(e){ return null; } }
+function getAuth(){
+  let a = null;
+  try { a = JSON.parse(store.get('asana_auth', 'null')); } catch(e){}
+  // 權限範圍改過時，舊的登入要重新來一次
+  if (a && a.scopes !== SCOPES){ store.del('asana_auth'); a = null; }
+  return a;
+}
 function saveAuth(a){ store.set('asana_auth', JSON.stringify(a)); }
 function b64url(bytes){ return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
 function randStr(n){ const a = new Uint8Array(n); crypto.getRandomValues(a); return b64url(a); }
@@ -170,7 +176,7 @@ async function handleRedirect(){
   setMsg('loginMsg', '登入中…');
   try {
     const d = await authCall('/token', { code, code_verifier: store.get('pkce_verifier', '') });
-    saveAuth({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000, name: d.name });
+    saveAuth({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000, name: d.name, scopes: SCOPES });
     setMsg('loginMsg', '');
   } catch(e){ setMsg('loginMsg', '登入失敗：' + e.message, 'err'); }
   store.del('pkce_verifier'); store.del('oauth_state');
@@ -453,38 +459,53 @@ $('btnFind').onclick = () => { const t = cleanCode($('code').value); if (t) find
 $('code').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnFind').click(); });
 
 // ---------- find task ----------
+// 先用 Asana 搜尋（實測會比對到留言內容）；找不到再逐一翻近 60 天任務的留言
+function renderTasks(list, code){
+  const box = $('tasks');
+  box.innerHTML = ''; box.className = '';
+  list.forEach(t => {
+    const d = document.createElement('div');
+    d.className = 'task';
+    d.innerHTML = '<div class="n"></div><div class="m"></div>';
+    d.querySelector('.n').textContent = t.name + (t.completed ? '（已完成）' : '');
+    const a = document.createElement('a'); a.href = t.permalink_url; a.target = '_blank'; a.textContent = '在 Asana 開啟';
+    a.onclick = e => e.stopPropagation();
+    d.querySelector('.m').appendChild(a);
+    d.onclick = () => { selectedTask = t; [...box.querySelectorAll('.task')].forEach(c => c.classList.remove('sel')); d.classList.add('sel'); updateUploadBtn(); };
+    box.appendChild(d);
+  });
+  if (list.length === 1) box.querySelector('.task').click();
+  else { const n = document.createElement('div'); n.className = 'msg'; n.textContent = '找到 ' + list.length + ' 筆含有 ' + code + ' 的任務，請點選正確的那一筆'; box.prepend(n); }
+}
+async function searchByComments(code, onProgress){
+  const since = new Date(Date.now() - 60 * 864e5).toISOString();
+  const r = await asana('/projects/' + cfg.proj + '/tasks?' + new URLSearchParams({ completed_since: since, opt_fields: 'name,completed,permalink_url,modified_at', limit: '100' }));
+  const tasks = (r.data || []).sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || ''));
+  const hits = [];
+  for (let i = 0; i < tasks.length && !hits.length; i += 6){
+    onProgress(i, tasks.length);
+    await Promise.all(tasks.slice(i, i + 6).map(async t => {
+      const s = await asana('/tasks/' + t.gid + '/stories?' + new URLSearchParams({ opt_fields: 'text,resource_subtype', limit: '100' }));
+      if ((s.data || []).some(x => x.resource_subtype === 'comment_added' && (x.text || '').toUpperCase().includes(code))) hits.push(t);
+    }));
+  }
+  return hits;
+}
 async function findTask(code){
   selectedTask = null; updateUploadBtn();
   const box = $('tasks');
   box.className = 'msg'; box.textContent = '在 Asana 搜尋 ' + code + ' …';
   try {
     const q = new URLSearchParams({
-      text: code,
-      'projects.any': cfg.proj,
-      opt_fields: 'name,completed,permalink_url,memberships.section.name,memberships.project.gid',
-      sort_by: 'modified_at',
-      limit: '20'
+      text: code, 'projects.any': cfg.proj,
+      opt_fields: 'name,completed,permalink_url', sort_by: 'modified_at', limit: '20'
     });
-    const r = await asana('/workspaces/' + cfg.ws + '/tasks/search?' + q);
-    const list = r.data || [];
-    if (!list.length){ box.className = 'msg err'; box.textContent = '找不到含有 ' + code + ' 的任務。\n（剛新增的留言可能要等 1～2 分鐘 Asana 才搜得到）'; return; }
-    box.innerHTML = '';
-    box.className = '';
-    list.forEach(t => {
-      const sec = (t.memberships || []).filter(m => m.project && m.project.gid === cfg.proj).map(m => m.section && m.section.name).filter(Boolean).join('、');
-      const d = document.createElement('div');
-      d.className = 'task';
-      d.innerHTML = '<div class="n"></div><div class="m"></div>';
-      d.querySelector('.n').textContent = t.name + (t.completed ? '（已完成）' : '');
-      d.querySelector('.m').textContent = (sec ? '區段：' + sec + '　' : '') ;
-      const a = document.createElement('a'); a.href = t.permalink_url; a.target = '_blank'; a.textContent = '開啟';
-      a.onclick = e => e.stopPropagation();
-      d.querySelector('.m').appendChild(a);
-      d.onclick = () => { selectedTask = t; [...box.children].forEach(c => c.classList.remove('sel')); d.classList.add('sel'); updateUploadBtn(); };
-      box.appendChild(d);
-    });
-    if (list.length === 1) box.firstChild.click();
-    else { const n = document.createElement('div'); n.className = 'msg'; n.textContent = '找到 ' + list.length + ' 筆，請點選正確的任務'; box.prepend(n); }
+    let list = (await asana('/workspaces/' + cfg.ws + '/tasks/search?' + q)).data || [];
+    if (!list.length){
+      list = await searchByComments(code, (i, n) => { box.textContent = '逐一檢查任務留言中… ' + i + ' / ' + n; });
+    }
+    if (!list.length){ box.className = 'msg err'; box.textContent = '在「門市-倉儲」近 60 天的任務留言裡找不到 ' + code + '。請確認單號，或手動在 Asana 找到任務。'; return; }
+    renderTasks(list, code);
   } catch(e){ box.className = 'msg err'; box.textContent = '搜尋失敗：' + e.message; }
 }
 
@@ -533,28 +554,50 @@ function updateUploadBtn(){
   $('btnUpload').textContent = selectedTask ? ('上傳 ' + photos.length + ' 張到「' + selectedTask.name + '」') : '上傳到任務（先選任務）';
 }
 
-// ---------- upload ----------
+// ---------- upload：照片傳成附件，再在任務底下留一則留言（含照片） ----------
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+async function postPhotoComment(task, code, atts){
+  const head = '📷 出庫照片 ' + atts.length + ' 張' + (code !== 'PHOTO' ? '（單號 ' + esc(code) + '）' : '');
+  const post = html => asana('/tasks/' + task.gid + '/stories', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: { html_text: '<body>' + html + '</body>' } })
+  });
+  try {
+    // 先試留言內直接顯示照片
+    await post(head + '\n' + atts.map(a => '<img data-asana-gid="' + a.gid + '"/>').join(''));
+  } catch(e){
+    if (/scope/i.test(e.message)) throw e;
+    // Asana 不接受留言內嵌圖片時，改成照片連結
+    await post(head + '\n' + atts.map((a, i) => '<a href="' + esc(a.permanent_url || a.view_url || '') + '">照片 ' + (i + 1) + '</a>').join('\n'));
+  }
+}
 $('btnUpload').onclick = async () => {
   const task = selectedTask; if (!task || !photos.length) return;
   $('btnUpload').disabled = true;
-  const code = cleanCode($('code').value) || 'photo';
+  const code = cleanCode($('code').value) || 'PHOTO';
   const stamp = new Date().toISOString().slice(0,19).replace(/[-:T]/g,'');
-  let ok = 0;
+  const atts = [];
   for (let i = 0; i < photos.length; i++){
     setMsg('upMsg', '上傳中 ' + (i + 1) + ' / ' + photos.length + ' …');
     const fd = new FormData();
     fd.append('parent', task.gid);
     fd.append('file', photos[i].blob, code + '_' + stamp + '_' + (i + 1) + '.jpg');
-    try { await asana('/attachments', { method: 'POST', body: fd }); ok++; }
+    try { const r = await asana('/attachments?opt_fields=permanent_url,view_url', { method: 'POST', body: fd }); atts.push(r.data); }
     catch(e){
-      setMsg('upMsg', '第 ' + (i + 1) + ' 張上傳失敗：' + e.message + '\n已成功 ' + ok + ' 張；失敗的照片仍保留，可再按一次上傳。', 'err');
-      photos.splice(0, ok).forEach(p => URL.revokeObjectURL(p.url));
+      setMsg('upMsg', '第 ' + (i + 1) + ' 張上傳失敗：' + e.message + '\n已成功 ' + atts.length + ' 張；失敗的照片仍保留，可再按一次上傳。', 'err');
+      photos.splice(0, atts.length).forEach(p => URL.revokeObjectURL(p.url));
       renderThumbs(); updateUploadBtn(); return;
     }
   }
   photos.forEach(p => URL.revokeObjectURL(p.url)); photos = [];
   renderThumbs(); updateUploadBtn();
-  setMsg('upMsg', '✅ 已上傳 ' + ok + ' 張到「' + task.name + '」', 'ok');
+  setMsg('upMsg', '照片已上傳，正在留言…');
+  try {
+    await postPhotoComment(task, code, atts);
+    setMsg('upMsg', '✅ 已上傳 ' + atts.length + ' 張，並在「' + task.name + '」底下留言', 'ok');
+  } catch(e){
+    setMsg('upMsg', '照片已上傳成附件（' + atts.length + ' 張），但留言失敗：' + e.message + (/scope/i.test(e.message) ? '\n請按右上「帳號」→ 登出，再重新登入一次。' : ''), 'err');
+  }
 };
 updateUploadBtn();
 </script>
