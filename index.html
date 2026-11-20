@@ -42,19 +42,21 @@ label{font-size:14px;color:var(--mute);display:block;margin:8px 0 4px}
 </style>
 </head>
 <body>
-<h1>出庫單拍照上傳 <button class="small ghost" id="btnSettings">設定</button></h1>
+<h1>出庫單拍照上傳 <button class="small ghost hidden" id="btnAccount">帳號</button></h1>
 
-<div class="card hidden" id="settings">
-  <div class="step">Asana 設定（只存在這支手機）</div>
-  <label for="pat">Asana 個人存取權杖（Personal Access Token）</label>
-  <input type="password" id="pat" autocomplete="off" placeholder="貼上你的 token">
-  <label for="ws">工作區 ID</label>
-  <input type="text" id="ws" inputmode="numeric">
-  <label for="proj">專案 ID（門市-倉儲）</label>
-  <input type="text" id="proj" inputmode="numeric">
-  <div style="height:10px"></div>
-  <button id="btnSave">儲存</button>
-  <div class="msg" id="setMsg"></div>
+<div class="card" id="loginCard">
+  <div class="step">Asana 帳號</div>
+  <div id="loggedOut">
+    <button id="btnLogin">用 Asana 帳號登入</button>
+    <div class="msg" style="font-size:13px;color:var(--mute)">會跳到 Asana 官方頁面，選好帳號按「允許」就完成；之後會一直保持登入。</div>
+  </div>
+  <div id="loggedIn" class="hidden">
+    <div class="row" style="align-items:center">
+      <div>已登入：<b id="whoami"></b></div>
+      <button class="small ghost" id="btnLogout" style="flex:0 0 auto">登出 / 換帳號</button>
+    </div>
+  </div>
+  <div class="msg" id="loginMsg"></div>
 </div>
 
 <div class="card">
@@ -100,47 +102,114 @@ label{font-size:14px;color:var(--mute);display:block;margin:8px 0 4px}
 <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script>
 const API = 'https://app.asana.com/api/1.0';
+// ===== 設定（建好 Asana 應用程式與 Cloudflare Worker 後填入） =====
+const ASANA_CLIENT_ID = '1220734431533437';
+const AUTH_SERVER = 'https://scan-upload-auth.qwe871126.workers.dev';
+const REDIRECT_URI = 'https://yinyiya.github.io/scan-upload/';
+const SCOPES = 'tasks:read attachments:write users:read';
+const WORKSPACE = '1207521339934269';
+const PROJECT = '1209208905247931';            // 門市-倉儲
+// =================================================================
 const $ = id => document.getElementById(id);
 const store = {
-  get(k, d){ try { return localStorage.getItem(k) ?? d; } catch(e){ return d; } },
-  set(k, v){ try { localStorage.setItem(k, v); } catch(e){} }
+  get(k, d){ try { const v = localStorage.getItem(k); return v === null ? d : v; } catch(e){ return d; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch(e){} },
+  del(k){ try { localStorage.removeItem(k); } catch(e){} }
 };
-const cfg = {
-  get pat(){ return store.get('asana_pat',''); },
-  get ws(){ return store.get('asana_ws','1207521339934269'); },
-  get proj(){ return store.get('asana_proj','1209208905247931'); }
-};
+const cfg = { ws: WORKSPACE, proj: PROJECT };
 let selectedTask = null;
 let photos = []; // {blob, url}
 
-// ---------- settings ----------
-function openSettings(show){
-  $('settings').classList.toggle('hidden', !show);
-  if (show){ $('pat').value = cfg.pat; $('ws').value = cfg.ws; $('proj').value = cfg.proj; }
-}
-$('btnSettings').onclick = () => openSettings($('settings').classList.contains('hidden'));
-$('btnSave').onclick = async () => {
-  store.set('asana_pat', $('pat').value.trim());
-  store.set('asana_ws', $('ws').value.trim());
-  store.set('asana_proj', $('proj').value.trim());
-  setMsg('setMsg', '檢查中…');
-  try {
-    const me = await asana('/users/me?opt_fields=name');
-    setMsg('setMsg', '已連線：' + me.data.name, 'ok');
-    setTimeout(() => openSettings(false), 800);
-  } catch(e){ setMsg('setMsg', '連線失敗：' + e.message, 'err'); }
-};
-if (!cfg.pat) openSettings(true);
-
 function setMsg(id, text, cls){ const el = $(id); el.textContent = text; el.className = 'msg' + (cls ? ' ' + cls : ''); }
 
-async function asana(path, opts = {}){
-  if (!cfg.pat) throw new Error('請先在「設定」貼上 Asana token');
-  const res = await fetch(API + path, { ...opts, headers: { Authorization: 'Bearer ' + cfg.pat, ...(opts.headers || {}) } });
+// ---------- Asana 登入（OAuth + PKCE，密鑰放在 Cloudflare Worker） ----------
+function getAuth(){ try { return JSON.parse(store.get('asana_auth', 'null')); } catch(e){ return null; } }
+function saveAuth(a){ store.set('asana_auth', JSON.stringify(a)); }
+function b64url(bytes){ return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+function randStr(n){ const a = new Uint8Array(n); crypto.getRandomValues(a); return b64url(a); }
+
+function showLogin(){
+  const a = getAuth();
+  $('loggedOut').classList.toggle('hidden', !!a);
+  $('loggedIn').classList.toggle('hidden', !a);
+  $('btnAccount').classList.toggle('hidden', !a);
+  $('loginCard').classList.toggle('hidden', !!a && !showLogin.open);
+  if (a) $('whoami').textContent = a.name || '（已登入）';
+}
+$('btnAccount').onclick = () => { showLogin.open = !showLogin.open; showLogin(); };
+
+$('btnLogin').onclick = async () => {
+  if (ASANA_CLIENT_ID.startsWith('__')) { setMsg('loginMsg', '登入功能還沒設定完成（缺 Client ID）', 'err'); return; }
+  const verifier = randStr(48);
+  const state = randStr(16);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  store.set('pkce_verifier', verifier);
+  store.set('oauth_state', state);
+  const q = new URLSearchParams({
+    client_id: ASANA_CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: 'code',
+    state, code_challenge_method: 'S256', code_challenge: b64url(digest), scope: SCOPES
+  });
+  location.href = 'https://app.asana.com/-/oauth_authorize?' + q.toString().replace(/\+/g, '%20');
+};
+
+async function authCall(path, body){
+  const r = await fetch(AUTH_SERVER + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error_description || d.error || ('HTTP ' + r.status));
+  return d;
+}
+
+// 從 Asana 登入頁回來時（網址帶 ?code=...）
+async function handleRedirect(){
+  const u = new URL(location.href);
+  const code = u.searchParams.get('code'), err = u.searchParams.get('error'), state = u.searchParams.get('state');
+  if (!code && !err) return;
+  history.replaceState(null, '', REDIRECT_URI);
+  if (err){ setMsg('loginMsg', '登入取消或失敗：' + err, 'err'); return; }
+  if (state !== store.get('oauth_state', '')){ setMsg('loginMsg', '登入驗證不符，請再按一次登入', 'err'); return; }
+  setMsg('loginMsg', '登入中…');
+  try {
+    const d = await authCall('/token', { code, code_verifier: store.get('pkce_verifier', '') });
+    saveAuth({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000, name: d.name });
+    setMsg('loginMsg', '');
+  } catch(e){ setMsg('loginMsg', '登入失敗：' + e.message, 'err'); }
+  store.del('pkce_verifier'); store.del('oauth_state');
+}
+
+let refreshing = null;
+async function refreshToken(){
+  const a = getAuth(); if (!a || !a.refresh_token) throw new Error('請先登入 Asana');
+  if (!refreshing){
+    refreshing = authCall('/refresh', { refresh_token: a.refresh_token })
+      .then(d => { saveAuth({ ...a, access_token: d.access_token, refresh_token: d.refresh_token || a.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000 }); })
+      .catch(e => { if (/invalid_grant|unauthorized/i.test(e.message)) { store.del('asana_auth'); showLogin(); throw new Error('登入已失效，請重新登入 Asana'); } throw e; })
+      .finally(() => { refreshing = null; });
+  }
+  return refreshing;
+}
+async function accessToken(){
+  const a = getAuth(); if (!a) { showLogin(); throw new Error('請先登入 Asana'); }
+  if (Date.now() > a.expires_at - 60000) await refreshToken();
+  return getAuth().access_token;
+}
+
+$('btnLogout').onclick = async () => {
+  const a = getAuth();
+  store.del('asana_auth');
+  showLogin.open = false; showLogin();
+  if (a && a.refresh_token) { try { await authCall('/revoke', { refresh_token: a.refresh_token }); } catch(e){} }
+  setMsg('loginMsg', '已登出。要換帳號：按登入後，在 Asana 頁面切換或登出原帳號。', 'ok');
+};
+
+async function asana(path, opts = {}, retried){
+  const tok = await accessToken();
+  const res = await fetch(API + path, { ...opts, headers: { Authorization: 'Bearer ' + tok, ...(opts.headers || {}) } });
+  if (res.status === 401 && !retried){ await refreshToken(); return asana(path, opts, true); }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error((body.errors && body.errors[0] && body.errors[0].message) || ('HTTP ' + res.status));
   return body;
 }
+handleRedirect().finally(showLogin);
 
 // ---------- scanning ----------
 // 引擎：手機有原生 BarcodeDetector（多數 Android Chrome）就用原生（最快）；否則用 ZXing。
