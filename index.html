@@ -29,7 +29,9 @@ input[type=text],input[type=password]{width:100%;padding:12px;border:1px solid v
 .code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:20px;font-weight:700;letter-spacing:.5px}
 .task{border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:8px;cursor:pointer}
 .task.sel{border-color:var(--accent);outline:2px solid var(--accent)}
-.task .n{font-weight:600}.task .m{font-size:13px;color:var(--mute)}
+.task .n{font-weight:600}
+.route{display:inline-block;font-size:14px;font-weight:700;padding:2px 8px;border-radius:6px;margin-right:8px;color:#fff;vertical-align:1px}
+.route.r-hm{background:#2e8b57}.route.r-ch{background:#d64545}.task .m{font-size:13px;color:var(--mute)}
 .thumbs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:8px 0}
 .thumbs div{position:relative}
 .thumbs img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;display:block}
@@ -401,7 +403,14 @@ function renderTasks(list, note, autoPick){
     const d = document.createElement('div');
     d.className = 'task';
     d.innerHTML = '<div class="n"></div><div class="m"></div>';
-    d.querySelector('.n').textContent = t.name + (t.completed ? '（已完成）' : '');
+    const n = d.querySelector('.n');
+    if (t.route){
+      const b = document.createElement('span');
+      b.className = 'route ' + (/^和美/.test(t.route) ? 'r-hm' : 'r-ch');
+      b.textContent = t.route.replace('>', ' → ');
+      n.appendChild(b);
+    }
+    n.appendChild(document.createTextNode(t.name + (t.completed ? '（已完成）' : '')));
     const day = (t.modified_at || '').slice(5, 10).replace('-', '/');
     d.querySelector('.m').textContent = (t.section ? t.section + '　' : '') + (day ? '最後更新 ' + day + '　' : '');
     const a = document.createElement('a'); a.href = t.permalink_url; a.target = '_blank'; a.textContent = '在 Asana 開啟';
@@ -486,7 +495,7 @@ function renderThumbs(){
 }
 function updateUploadBtn(){
   $('btnUpload').disabled = !(selectedTask && photos.length);
-  $('btnUpload').textContent = selectedTask ? ('上傳 ' + photos.length + ' 張到「' + selectedTask.name + '」') : '上傳到任務（先選任務）';
+  $('btnUpload').textContent = selectedTask ? ('上傳 ' + photos.length + ' 張到「' + (selectedTask.route ? selectedTask.route.replace('>', '→') + ' ' : '') + selectedTask.name + '」') : '上傳到任務（先選任務）';
 }
 
 // ---------- upload：照片傳成任務附件，再留一則文字留言（記錄單號與拍照人） ----------
