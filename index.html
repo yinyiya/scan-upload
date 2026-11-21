@@ -42,21 +42,16 @@ label{font-size:14px;color:var(--mute);display:block;margin:8px 0 4px}
 </style>
 </head>
 <body>
-<h1>出庫單拍照上傳 <button class="small ghost hidden" id="btnAccount">帳號</button></h1>
+<h1>出庫單拍照上傳 <button class="small ghost hidden" id="btnAccount">⚙</button></h1>
 
-<div class="card" id="loginCard">
-  <div class="step">Asana 帳號</div>
-  <div id="loggedOut">
-    <button id="btnLogin">用 Asana 帳號登入</button>
-    <div class="msg" style="font-size:13px;color:var(--mute)">會在瀏覽器裡打開 Asana 官方登入頁（公司 SSO 也可以），按「允許」就完成；之後會一直保持登入。</div>
-    <div class="msg" style="font-size:13px;color:var(--mute)">如果跳到 Asana App 顯示「無法載入內容」：回到這頁，<b>長按</b>下面這個連結 →「在新分頁中打開」。<br><a id="loginLink" href="#">👉 在瀏覽器登入 Asana</a></div>
-  </div>
-  <div id="loggedIn" class="hidden">
-    <div class="row" style="align-items:center">
-      <div>已登入：<b id="whoami"></b></div>
-      <button class="small ghost" id="btnLogout" style="flex:0 0 auto">登出 / 換帳號</button>
-    </div>
-  </div>
+<div class="card hidden" id="loginCard">
+  <div class="step">第一次使用設定</div>
+  <label for="pass">通關密碼</label>
+  <input type="password" id="pass" autocomplete="off">
+  <label for="who">你的名字（會記錄在任務留言）</label>
+  <input type="text" id="who" autocomplete="name">
+  <div style="height:10px"></div>
+  <button id="btnStart">開始使用</button>
   <div class="msg" id="loginMsg"></div>
 </div>
 
@@ -102,140 +97,58 @@ label{font-size:14px;color:var(--mute);display:block;margin:8px 0 4px}
 
 <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
 <script>
-const API = 'https://app.asana.com/api/1.0';
-// ===== 設定（建好 Asana 應用程式與 Cloudflare Worker 後填入） =====
-const ASANA_CLIENT_ID = '1220734431533437';
-const AUTH_SERVER = 'https://scan-upload-auth.qwe871126.workers.dev';
-const REDIRECT_URI = 'https://yinyiya.github.io/scan-upload/';
-const SCOPES = 'tasks:read attachments:write users:read stories:read stories:write';
-const WORKSPACE = '1207521339934269';
-const PROJECT = '1209208905247931';            // 門市-倉儲
-// =================================================================
+// ===== 設定 =====
+const BACKEND = 'https://scan-upload-auth.qwe871126.workers.dev';
+// =================
 const $ = id => document.getElementById(id);
 const store = {
   get(k, d){ try { const v = localStorage.getItem(k); return v === null ? d : v; } catch(e){ return d; } },
   set(k, v){ try { localStorage.setItem(k, v); } catch(e){} },
   del(k){ try { localStorage.removeItem(k); } catch(e){} }
 };
-const cfg = { ws: WORKSPACE, proj: PROJECT };
 let selectedTask = null;
 let photos = []; // {blob, url}
 
 function setMsg(id, text, cls){ const el = $(id); el.textContent = text; el.className = 'msg' + (cls ? ' ' + cls : ''); }
 
-// ---------- Asana 登入（OAuth + PKCE，密鑰放在 Cloudflare Worker） ----------
-function getAuth(){
-  let a = null;
-  try { a = JSON.parse(store.get('asana_auth', 'null')); } catch(e){}
-  // 權限範圍改過時，舊的登入要重新來一次
-  if (a && a.scopes !== SCOPES){ store.del('asana_auth'); a = null; }
-  return a;
+// ---------- 通關密碼 + 名字（跟退貨拆包系統一樣，不用登入 Asana） ----------
+const me = { get pass(){ return store.get('scan_pass', ''); }, get name(){ return store.get('scan_name', ''); } };
+function showSetup(show){
+  $('loginCard').classList.toggle('hidden', !show);
+  $('btnAccount').classList.toggle('hidden', !me.pass);
+  $('btnAccount').textContent = (me.name ? me.name + ' ' : '') + '⚙';
+  if (show){ $('pass').value = me.pass; $('who').value = me.name; }
 }
-function saveAuth(a){ store.set('asana_auth', JSON.stringify(a)); }
-function b64url(bytes){ return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
-function randStr(n){ const a = new Uint8Array(n); crypto.getRandomValues(a); return b64url(a); }
-
-function showLogin(){
-  const a = getAuth();
-  $('loggedOut').classList.toggle('hidden', !!a);
-  $('loggedIn').classList.toggle('hidden', !a);
-  $('btnAccount').classList.toggle('hidden', !a);
-  $('loginCard').classList.toggle('hidden', !!a && !showLogin.open);
-  if (a) $('whoami').textContent = a.name || '（已登入）';
-}
-$('btnAccount').onclick = () => { showLogin.open = !showLogin.open; showLogin(); };
-
-// 預先產生登入網址（PKCE），按鈕與備用連結共用同一組
-let loginUrl = null;
-async function prepareLogin(){
-  const verifier = randStr(48);
-  const state = randStr(16);
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
-  store.set('pkce_verifier', verifier);
-  store.set('oauth_state', state);
-  const q = new URLSearchParams({
-    client_id: ASANA_CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: 'code',
-    state, code_challenge_method: 'S256', code_challenge: b64url(digest), scope: SCOPES
-  });
-  loginUrl = 'https://app.asana.com/-/oauth_authorize?' + q.toString().replace(/\+/g, '%20');
-  $('loginLink').href = loginUrl;
-  return loginUrl;
-}
-// iPhone 有裝 Asana App 時，直接點 app.asana.com 的連結會被 App 攔走（App 打不開登入頁）。
-// 所以先跳到自己的頁面（?go=1），再由頁面自動轉到 Asana —— 非手指點擊的轉址不會被 App 攔截。
-$('btnLogin').onclick = async () => {
-  const url = loginUrl || await prepareLogin();
-  store.set('auth_go', url);
-  location.href = REDIRECT_URI + '?go=1';
+$('btnAccount').onclick = () => showSetup($('loginCard').classList.contains('hidden'));
+$('btnStart').onclick = async () => {
+  const pass = $('pass').value.trim(), name = $('who').value.trim();
+  if (!pass) return setMsg('loginMsg', '請輸入通關密碼', 'err');
+  if (!name) return setMsg('loginMsg', '請輸入你的名字', 'err');
+  setMsg('loginMsg', '確認中…');
+  try {
+    await api('/api/check', {}, pass);
+    store.set('scan_pass', pass); store.set('scan_name', name);
+    setMsg('loginMsg', '');
+    showSetup(false);
+  } catch(e){ setMsg('loginMsg', e.message, 'err'); }
 };
 
-async function authCall(path, body){
-  const r = await fetch(AUTH_SERVER + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+// 呼叫後端；body 是物件就送 JSON，是 FormData 就直接送
+async function api(path, body, passOverride){
+  const pass = passOverride || me.pass;
+  if (!pass){ showSetup(true); throw new Error('請先輸入通關密碼'); }
+  const isForm = body instanceof FormData;
+  const r = await fetch(BACKEND + path, {
+    method: 'POST',
+    headers: isForm ? { 'X-Access-Code': pass } : { 'X-Access-Code': pass, 'Content-Type': 'application/json' },
+    body: isForm ? body : JSON.stringify(body || {})
+  });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error_description || d.error || ('HTTP ' + r.status));
+  if (r.status === 401 && !passOverride){ store.del('scan_pass'); showSetup(true); }
+  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
 }
-
-// 從 Asana 登入頁回來時（網址帶 ?code=...）
-async function handleRedirect(){
-  const u = new URL(location.href);
-  const code = u.searchParams.get('code'), err = u.searchParams.get('error'), state = u.searchParams.get('state');
-  if (!code && !err) return;
-  history.replaceState(null, '', REDIRECT_URI);
-  if (err){ setMsg('loginMsg', '登入取消或失敗：' + err, 'err'); return; }
-  if (state !== store.get('oauth_state', '')){ setMsg('loginMsg', '登入驗證不符，請再按一次登入', 'err'); return; }
-  setMsg('loginMsg', '登入中…');
-  try {
-    const d = await authCall('/token', { code, code_verifier: store.get('pkce_verifier', '') });
-    saveAuth({ access_token: d.access_token, refresh_token: d.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000, name: d.name, scopes: SCOPES });
-    setMsg('loginMsg', '');
-  } catch(e){ setMsg('loginMsg', '登入失敗：' + e.message, 'err'); }
-  store.del('pkce_verifier'); store.del('oauth_state');
-}
-
-let refreshing = null;
-async function refreshToken(){
-  const a = getAuth(); if (!a || !a.refresh_token) throw new Error('請先登入 Asana');
-  if (!refreshing){
-    refreshing = authCall('/refresh', { refresh_token: a.refresh_token })
-      .then(d => { saveAuth({ ...a, access_token: d.access_token, refresh_token: d.refresh_token || a.refresh_token, expires_at: Date.now() + (d.expires_in || 3600) * 1000 }); })
-      .catch(e => { if (/invalid_grant|unauthorized/i.test(e.message)) { store.del('asana_auth'); showLogin(); throw new Error('登入已失效，請重新登入 Asana'); } throw e; })
-      .finally(() => { refreshing = null; });
-  }
-  return refreshing;
-}
-async function accessToken(){
-  const a = getAuth(); if (!a) { showLogin(); throw new Error('請先登入 Asana'); }
-  if (Date.now() > a.expires_at - 60000) await refreshToken();
-  return getAuth().access_token;
-}
-
-$('btnLogout').onclick = async () => {
-  const a = getAuth();
-  store.del('asana_auth');
-  showLogin.open = false; showLogin();
-  if (a && a.refresh_token) { try { await authCall('/revoke', { refresh_token: a.refresh_token }); } catch(e){} }
-  setMsg('loginMsg', '已登出。要換帳號：按登入後，在 Asana 頁面切換或登出原帳號。', 'ok');
-};
-
-async function asana(path, opts = {}, retried){
-  const tok = await accessToken();
-  const res = await fetch(API + path, { ...opts, headers: { Authorization: 'Bearer ' + tok, ...(opts.headers || {}) } });
-  if (res.status === 401 && !retried){ await refreshToken(); return asana(path, opts, true); }
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((body.errors && body.errors[0] && body.errors[0].message) || ('HTTP ' + res.status));
-  return body;
-}
-(function boot(){
-  const u = new URL(location.href);
-  if (u.searchParams.get('go') === '1'){
-    const go = store.get('auth_go', '');
-    store.del('auth_go');
-    if (go.startsWith('https://app.asana.com/-/oauth_authorize?')){ location.replace(go); return; }
-    history.replaceState(null, '', REDIRECT_URI);
-  }
-  handleRedirect().finally(() => { showLogin(); if (!getAuth()) prepareLogin(); });
-})();
+showSetup(!me.pass || !me.name);
 
 // ---------- scanning ----------
 // 引擎：手機有原生 BarcodeDetector（多數 Android Chrome）就用原生（最快）；否則用 ZXing。
@@ -479,7 +392,7 @@ $('btnFind').onclick = () => { const t = cleanCode($('code').value); if (t) find
 $('code').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnFind').click(); });
 
 // ---------- find task ----------
-// 先用 Asana 搜尋（實測會比對到留言內容）；找不到再逐一翻近 60 天任務的留言
+// 先用 Asana 搜尋（會比對到留言內容）；找不到再逐批翻近 60 天任務的留言
 function renderTasks(list, code){
   const box = $('tasks');
   box.innerHTML = ''; box.className = '';
@@ -498,29 +411,21 @@ function renderTasks(list, code){
   else { const n = document.createElement('div'); n.className = 'msg'; n.textContent = '找到 ' + list.length + ' 筆含有 ' + code + ' 的任務，請點選正確的那一筆'; box.prepend(n); }
 }
 async function searchByComments(code, onProgress){
-  const since = new Date(Date.now() - 60 * 864e5).toISOString();
-  const r = await asana('/projects/' + cfg.proj + '/tasks?' + new URLSearchParams({ completed_since: since, opt_fields: 'name,completed,permalink_url,modified_at', limit: '100' }));
-  const tasks = (r.data || []).sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || ''));
-  const hits = [];
-  for (let i = 0; i < tasks.length && !hits.length; i += 6){
+  const tasks = ((await api('/api/recent')).tasks || []).sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || ''));
+  for (let i = 0; i < tasks.length; i += 20){
     onProgress(i, tasks.length);
-    await Promise.all(tasks.slice(i, i + 6).map(async t => {
-      const s = await asana('/tasks/' + t.gid + '/stories?' + new URLSearchParams({ opt_fields: 'text,resource_subtype', limit: '100' }));
-      if ((s.data || []).some(x => x.resource_subtype === 'comment_added' && (x.text || '').toUpperCase().includes(code))) hits.push(t);
-    }));
+    const batch = tasks.slice(i, i + 20);
+    const { hits } = await api('/api/scan', { code, gids: batch.map(t => t.gid) });
+    if (hits && hits.length) return batch.filter(t => hits.includes(t.gid));
   }
-  return hits;
+  return [];
 }
 async function findTask(code){
   selectedTask = null; updateUploadBtn();
   const box = $('tasks');
   box.className = 'msg'; box.textContent = '在 Asana 搜尋 ' + code + ' …';
   try {
-    const q = new URLSearchParams({
-      text: code, 'projects.any': cfg.proj,
-      opt_fields: 'name,completed,permalink_url', sort_by: 'modified_at', limit: '20'
-    });
-    let list = (await asana('/workspaces/' + cfg.ws + '/tasks/search?' + q)).data || [];
+    let list = (await api('/api/search', { code })).tasks || [];
     if (!list.length){
       list = await searchByComments(code, (i, n) => { box.textContent = '逐一檢查任務留言中… ' + i + ' / ' + n; });
     }
@@ -574,33 +479,22 @@ function updateUploadBtn(){
   $('btnUpload').textContent = selectedTask ? ('上傳 ' + photos.length + ' 張到「' + selectedTask.name + '」') : '上傳到任務（先選任務）';
 }
 
-// ---------- upload：照片傳成附件，再在任務底下留一則留言（含照片） ----------
-function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-async function postPhotoComment(task, code, atts){
-  const head = '📷 出庫照片 ' + atts.length + ' 張' + (code !== 'PHOTO' ? '（單號 ' + esc(code) + '）' : '');
-  const post = html => asana('/tasks/' + task.gid + '/stories', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ data: { html_text: '<body>' + html + '</body>' } })
-  });
-  // 照片本身上傳後，Asana 會自動在任務底下顯示「已附加」並附縮圖；
-  // 留言只寫文字說明，避免同一張照片出現兩次。
-  await post(head);
-}
+// ---------- upload：照片傳成任務附件，再留一則文字留言（記錄單號與拍照人） ----------
 $('btnUpload').onclick = async () => {
   const task = selectedTask; if (!task || !photos.length) return;
   $('btnUpload').disabled = true;
-  const code = cleanCode($('code').value) || 'PHOTO';
+  const code = cleanCode($('code').value);
   const stamp = new Date().toISOString().slice(0,19).replace(/[-:T]/g,'');
-  const atts = [];
+  let ok = 0;
   for (let i = 0; i < photos.length; i++){
     setMsg('upMsg', '上傳中 ' + (i + 1) + ' / ' + photos.length + ' …');
     const fd = new FormData();
-    fd.append('parent', task.gid);
-    fd.append('file', photos[i].blob, code + '_' + stamp + '_' + (i + 1) + '.jpg');
-    try { const r = await asana('/attachments?opt_fields=permanent_url,view_url', { method: 'POST', body: fd }); atts.push(r.data); }
+    fd.append('task', task.gid);
+    fd.append('file', photos[i].blob, (code || 'photo') + '_' + stamp + '_' + (i + 1) + '.jpg');
+    try { await api('/api/upload', fd); ok++; }
     catch(e){
-      setMsg('upMsg', '第 ' + (i + 1) + ' 張上傳失敗：' + e.message + '\n已成功 ' + atts.length + ' 張；失敗的照片仍保留，可再按一次上傳。', 'err');
-      photos.splice(0, atts.length).forEach(p => URL.revokeObjectURL(p.url));
+      setMsg('upMsg', '第 ' + (i + 1) + ' 張上傳失敗：' + e.message + '\n已成功 ' + ok + ' 張；失敗的照片仍保留，可再按一次上傳。', 'err');
+      photos.splice(0, ok).forEach(p => URL.revokeObjectURL(p.url));
       renderThumbs(); updateUploadBtn(); return;
     }
   }
@@ -608,10 +502,10 @@ $('btnUpload').onclick = async () => {
   renderThumbs(); updateUploadBtn();
   setMsg('upMsg', '照片已上傳，正在留言…');
   try {
-    await postPhotoComment(task, code, atts);
-    setMsg('upMsg', '✅ 已上傳 ' + atts.length + ' 張，並在「' + task.name + '」底下留言', 'ok');
+    await api('/api/comment', { task: task.gid, count: ok, code, name: me.name });
+    setMsg('upMsg', '✅ 已上傳 ' + ok + ' 張，並在「' + task.name + '」底下留言', 'ok');
   } catch(e){
-    setMsg('upMsg', '照片已上傳成附件（' + atts.length + ' 張），但留言失敗：' + e.message + (/scope/i.test(e.message) ? '\n請按右上「帳號」→ 登出，再重新登入一次。' : ''), 'err');
+    setMsg('upMsg', '照片已上傳（' + ok + ' 張），但留言失敗：' + e.message, 'err');
   }
 };
 updateUploadBtn();
