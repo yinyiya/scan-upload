@@ -393,7 +393,8 @@ $('code').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnFind')
 
 // ---------- find task ----------
 // 先用 Asana 搜尋（會比對到留言內容）；找不到再逐批翻近 60 天任務的留言
-function renderTasks(list, code){
+// note：顯示在清單最上面的說明；autoPick：只有一筆時自動選
+function renderTasks(list, note, autoPick){
   const box = $('tasks');
   box.innerHTML = ''; box.className = '';
   list.forEach(t => {
@@ -401,14 +402,16 @@ function renderTasks(list, code){
     d.className = 'task';
     d.innerHTML = '<div class="n"></div><div class="m"></div>';
     d.querySelector('.n').textContent = t.name + (t.completed ? '（已完成）' : '');
+    const day = (t.modified_at || '').slice(5, 10).replace('-', '/');
+    d.querySelector('.m').textContent = (t.section ? t.section + '　' : '') + (day ? '最後更新 ' + day + '　' : '');
     const a = document.createElement('a'); a.href = t.permalink_url; a.target = '_blank'; a.textContent = '在 Asana 開啟';
     a.onclick = e => e.stopPropagation();
     d.querySelector('.m').appendChild(a);
     d.onclick = () => { selectedTask = t; [...box.querySelectorAll('.task')].forEach(c => c.classList.remove('sel')); d.classList.add('sel'); updateUploadBtn(); };
     box.appendChild(d);
   });
-  if (list.length === 1) box.querySelector('.task').click();
-  else { const n = document.createElement('div'); n.className = 'msg'; n.textContent = '找到 ' + list.length + ' 筆含有 ' + code + ' 的任務，請點選正確的那一筆'; box.prepend(n); }
+  if (autoPick && list.length === 1) box.querySelector('.task').click();
+  else if (note) { const n = document.createElement('div'); n.className = 'msg'; n.textContent = note; box.prepend(n); }
 }
 async function searchByComments(code, onProgress){
   const tasks = ((await api('/api/recent')).tasks || []).sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || ''));
@@ -416,21 +419,28 @@ async function searchByComments(code, onProgress){
     onProgress(i, tasks.length);
     const batch = tasks.slice(i, i + 20);
     const { hits } = await api('/api/scan', { code, gids: batch.map(t => t.gid) });
-    if (hits && hits.length) return batch.filter(t => hits.includes(t.gid));
+    if (hits && hits.length) return { hits: batch.filter(t => hits.includes(t.gid)), all: tasks };
   }
-  return [];
+  return { hits: [], all: tasks };
+}
+// 找不到單號時：列出未結案（不在「結案」區段）的任務讓人手動選
+async function showPicker(code){
+  const box = $('tasks');
+  box.className = 'msg'; box.textContent = '找不到 ' + code + '，載入未結案的任務…';
+  const list = ((await api('/api/open')).tasks || []).sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || ''));
+  if (!list.length){ box.className = 'msg err'; box.textContent = '找不到 ' + code + '，目前也沒有未結案的任務。請到 Asana 確認。'; return; }
+  renderTasks(list, '任務留言裡找不到 ' + code + '，請從下面的未結案任務點選正確的一筆。上傳後會自動在留言記下這個單號，下次就找得到。', false);
 }
 async function findTask(code){
   selectedTask = null; updateUploadBtn();
   const box = $('tasks');
   box.className = 'msg'; box.textContent = '在 Asana 搜尋 ' + code + ' …';
   try {
-    let list = (await api('/api/search', { code })).tasks || [];
-    if (!list.length){
-      list = await searchByComments(code, (i, n) => { box.textContent = '逐一檢查任務留言中… ' + i + ' / ' + n; });
-    }
-    if (!list.length){ box.className = 'msg err'; box.textContent = '在「門市-倉儲」近 60 天的任務留言裡找不到 ' + code + '。請確認單號，或手動在 Asana 找到任務。'; return; }
-    renderTasks(list, code);
+    const list = (await api('/api/search', { code })).tasks || [];
+    if (list.length) return renderTasks(list, '找到 ' + list.length + ' 筆含有 ' + code + ' 的任務，請點選正確的那一筆', true);
+    const r = await searchByComments(code, (i, n) => { box.textContent = '逐一檢查任務留言中… ' + i + ' / ' + n; });
+    if (r.hits.length) return renderTasks(r.hits, '找到 ' + r.hits.length + ' 筆含有 ' + code + ' 的任務，請點選正確的那一筆', true);
+    await showPicker(code);
   } catch(e){ box.className = 'msg err'; box.textContent = '搜尋失敗：' + e.message; }
 }
 
